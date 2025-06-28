@@ -5,6 +5,7 @@ using Testcontainers.MsSql;
 using Xunit;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
+using DotNet.Testcontainers.Networks;
 
 namespace Testcontainers_Template.Test;
 
@@ -13,13 +14,19 @@ public class WeatherForecastApiTests : IAsyncLifetime
     private readonly MsSqlContainer _dbContainer;
     private IContainer _apiContainer = null!;
     private readonly HttpClient _httpClient = new() { BaseAddress = new Uri("http://localhost:8080") };
+    private readonly INetwork network ;
 
     public WeatherForecastApiTests()
     {
+        network = new NetworkBuilder().WithName(Guid.NewGuid().ToString("D")).Build();
+        network.CreateAsync().GetAwaiter().GetResult();
+
         _dbContainer = new MsSqlBuilder()
             .WithImage("mcr.microsoft.com/mssql/server:2025-latest")
             .WithPassword("P@ssw0rd123!")
             .WithCleanUp(true)
+            .WithNetwork(network)
+            .WithNetworkAliases("db")
             .Build();
     }
 
@@ -27,11 +34,11 @@ public class WeatherForecastApiTests : IAsyncLifetime
     {
         await _dbContainer.StartAsync();
         var dockerfilePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../"));
-
         var image = new ImageFromDockerfileBuilder()
             .WithName("testcontainers_template")
             .WithDockerfileDirectory(dockerfilePath)
             .WithDockerfile("Testcontainers_Template/Dockerfile") // <- nome relativo nel contesto
+            //.withDokercompose?? :( https://github.com/testcontainers/testcontainers-dotnet/issues/122
             .Build();
         try
         {
@@ -43,22 +50,26 @@ public class WeatherForecastApiTests : IAsyncLifetime
             Console.WriteLine(ex.ToString());
             throw;
         }
-        var connStr = $"Server={_dbContainer.Hostname},{_dbContainer.GetMappedPublicPort(1433)};Database=weatherdb;User Id=sa;Password=Your_password123!;TrustServerCertificate=True;";
+        var internalConn = "Server=db,1433;Database=master;User Id=sa;Password=P@ssw0rd123!;Encrypt=true;TrustServerCertificate=true";
 
         _apiContainer = new ContainerBuilder()
             .WithImage(image)
-            .WithPortBinding(8080, 80)
-            .WithEnvironment("ConnectionStrings__DefaultConnection", connStr)
-           // .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(80)) // << Cambiato
-            /*
-            .WithWaitStrategy(Wait.ForUnixContainer().UntilHttpRequestIsSucceeded(r =>
-                r.ForPort(80).ForPath("/weatherforecast").ForStatusCode(System.Net.HttpStatusCode.OK)))*/
+            .WithNetwork(network)
+            .WithPortBinding(8080, 8080)
+            .WithEnvironment("ConnectionStrings__DefaultConnection", internalConn)
+            .WithWaitStrategy(
+                Wait.ForUnixContainer()
+                    .UntilPortIsAvailable(8080)
+                    .UntilHttpRequestIsSucceeded(r =>
+                        r.ForPort(8080)
+                         .ForPath("/weatherforecast")
+                         .ForStatusCode(System.Net.HttpStatusCode.OK)))
             .Build();
 
 
         await _apiContainer.StartAsync();
         Console.WriteLine("==== CONTAINER LOGS ====");
-        var logs = await _apiContainer.GetLogsAsync( );
+        var logs = await _apiContainer.GetLogsAsync();
         Console.WriteLine(logs);
     }
 
@@ -69,27 +80,40 @@ public class WeatherForecastApiTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task InsertAndVerifyForecast()
+    public async Task GetPostGet_VerifiesOneForecastInserted()
     {
+        // Primo GET: nessuno insertato
+        var firstGet = await _httpClient.GetFromJsonAsync<List<WeatherForecast>>("/weatherforecast");
+        Assert.NotNull(firstGet);
+        Assert.Empty(firstGet!);
+
+        // POST: inserisco un forecast
         var newForecast = new
         {
             Date = DateOnly.FromDateTime(DateTime.UtcNow),
             TemperatureC = 27,
             Summary = "Test summary"
         };
-        var health = await _httpClient.GetAsync("/weatherforecast");
-        Console.WriteLine($"API responded: {health.StatusCode}");
         var post = await _httpClient.PostAsJsonAsync("/weatherforecast", newForecast);
         post.EnsureSuccessStatusCode();
 
-        var connString = _dbContainer.GetConnectionString();
+        // Secondo GET: ci deve essere 1 elemento
+        var secondGet = await _httpClient.GetFromJsonAsync<List<WeatherForecast>>("/weatherforecast");
+        Assert.NotNull(secondGet);
+        Assert.Single(secondGet!);
+        Assert.Equal("Test summary", secondGet![0].Summary);
 
+        // Verifica diretta dal DB
+        var connString = _dbContainer.GetConnectionString(); // punta a master/TestDb via il builder
         using var conn = new SqlConnection(connString);
         await conn.OpenAsync();
-
-        using var cmd = new SqlCommand("SELECT COUNT(*) FROM WeatherForecast WHERE Summary = 'Test summary'", conn);
+        using var cmd = new SqlCommand(
+            "SELECT COUNT(*) FROM TestDb.dbo.WeatherForecast WHERE Summary = @s", conn
+        );
+        cmd.Parameters.AddWithValue("@s", "Test summary");
         var count = (int)await cmd.ExecuteScalarAsync();
 
-        Assert.True(count > 0, "Expected data to be inserted into WeatherForecast table.");
+        Assert.Equal(1, count);
     }
+
 }
